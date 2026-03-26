@@ -1,0 +1,192 @@
+function dates(yer, mon, day, hor) {
+  var date = ee.Date.fromYMD(yer, mon, day).advance(hor, 'hour');
+  var dst = date.millis().divide(1000 * 3600 * 24).add(719529);
+  return dst;
+}
+
+function dayornight(A, B1, B2) {
+  var c2 = ee.Image(0).where(A.gt(B1).and(A.lte(B2)), 1);
+   var c1 = ee.Image(0);
+  c1 = c1.where(c2.eq(1), 1).where(c2.eq(0), 0);
+  return [c1];
+}
+
+function mysun(lon, lat, alt, tz, dte) {
+  var n = dte.subtract(dates(2000, 1, 1, 12)).add(68.184 / 86400);
+  var geometry = lon.geometry();
+  var Js = ee.Image(n).subtract(lon.divide(360));
+
+  var M = ee.Image(357.5291).add(ee.Image(0.98560028).multiply(Js)).mod(360);
+  M = M.toFloat();
+  var radM = M.multiply(Math.PI / 180);
+
+  var C = ee.Image(1).expression(
+    "1.9148 * sin(A) + 0.0200 * sin(2*A) + 0.0003 * sin(3*A)",
+    { "A": radM }
+  );
+  C = C.toFloat();
+
+  var lambda = M.add(C).add(180).add(102.9372).mod(360);
+  var radLambda = lambda.multiply(Math.PI / 180);
+
+  var Jt = ee.Image(1).expression(
+    "2451545.5 + A + 0.0053 * sin(B) - 0.0069 * sin(2*C)",
+    { "A": Js, "B": radM, "C": radLambda }
+  );
+
+  var radtiltAngle = ee.Number(23.44).multiply(Math.PI / 180);
+  var delta = ee.Image(1).expression(
+    "asin(sin(A) * sin(B))",
+    { "A": radLambda, "B": radtiltAngle }
+  );
+
+  var radAlt = alt;
+  var radLat = lat.multiply(Math.PI / 180);
+  var radDelta = delta;
+  var radAltZero = radAlt.where(radAlt.lt(0), 0);
+
+  var ha = ee.Image(1).expression(
+    "((sin((-0.83 - 2.076 * sqrt(A) / 60)*3.141592654/180) - sin(B) * sin(C)) / (cos(B) * cos(C)))",
+    { "A": radAltZero, "B": radLat, "C": radDelta }
+  );
+
+  var omegaRad = ha.acos();
+  var omega = omegaRad.multiply(180 / Math.PI);
+  omega = omega.where(ha.lt(-1), 180);
+  omega = omega.where(ha.gt(1), 0);
+
+  var noon = Jt.add(dates(2000, 1, 1, 12)).subtract(ee.Image(2451545));
+  var sset = noon.add(omega.divide(360));
+  var srise = noon.subtract(omega.divide(360));
+
+  return [srise, sset];
+}
+
+var dataset = ee.Image('USGS/GMTED2010');
+var elevation = dataset.select('be75');
+
+var lon_grid = ee.Image.pixelLonLat().select('longitude');
+var lat_grid = ee.Image.pixelLonLat().select('latitude');
+var lon = lon_grid;
+var lat = lat_grid;
+var alt = elevation;
+var tz = 0;
+
+// range
+var START_YEAR = 2020;  
+var END_YEAR = 2020;     
+var START_MONTH = 4;    
+var END_MONTH = 6;      
+
+// annual cycle
+for (var i = START_YEAR; i <= END_YEAR; i++) {
+  
+    var current_start_month = (i === START_YEAR) ? START_MONTH : 1;
+  var current_end_month = (i === END_YEAR) ? END_MONTH : 12;
+  
+  // monthly cycle
+  for (var j = current_start_month; j <= current_end_month; j++) {
+    
+    var startDate = new Date(i, j - 1, 1);
+    var endDate = new Date(i, j, 0);
+    var daysInMonth = endDate.getDate();
+
+    // daily cycle
+    for (var k = 1; k <= daysInMonth; k++) {
+      
+      var dte = dates(i, j, k, 0).floor();
+      var result_sun = mysun(lon, lat, alt, tz, dte);
+      var srise = result_sun[0];
+      var sset = result_sun[1];
+
+      var day_vpd_mat_daily = ee.Image.constant(0).float();
+      var night_vpd_mat_daily = ee.Image.constant(0).float();
+      var c22 = ee.Image.constant(0).float();
+      var c33 = ee.Image.constant(0).float();
+
+      // hourly cycle
+      for (var h = 0; h <= 23; h++) {
+        var tim_mat = ee.Image(dates(i, j, k, h));
+        var c1 = dayornight(tim_mat, srise, sset);
+        var c2 = c1[0];
+        var c3 = ee.Image(1).subtract(c2);
+        
+        var strday = i + '-' + j + '-' + k;
+        var endday;
+        
+        if (k == daysInMonth && j == 12) {
+          var inex = i + 1;
+          endday = inex + '-01-01';
+        } else if (k == daysInMonth && j != 12) {
+          var jnex = j + 1;
+          endday = i + '-' + jnex + '-01';
+        } else {
+          var knex = k + 1;
+          endday = i + '-' + j + '-' + knex;
+        }
+
+        //VPD
+        var t_2m = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+                  .select('temperature_2m')
+                  .filterDate(strday, endday)
+                  .filter(ee.Filter.eq('hour', h));
+                  
+        var t_dew = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+                  .select('dewpoint_temperature_2m')
+                  .filterDate(strday, endday)
+                  .filter(ee.Filter.eq('hour', h));    
+       
+        var t_2m_1 = t_2m.first();
+        var t_dew_1 = t_dew.first();
+        
+        var vpd_expression = '(0.6108*exp((17.27*Ta)/(273.3+Ta)))-(0.6108*exp((17.27*Td)/(273.3+Td)))';
+        var vpd = ee.Image(1).expression(vpd_expression, {
+                  'Ta': t_2m_1.subtract(273.15),
+                  'Td': t_dew_1.subtract(273.15)
+                });
+                
+        var vpd_day = vpd.multiply(c2);
+        var vpd_night = vpd.multiply(c3);
+        
+        day_vpd_mat_daily = day_vpd_mat_daily.add(vpd_day);
+        night_vpd_mat_daily = night_vpd_mat_daily.add(vpd_night);  
+        
+        c22 = c22.add(c2);
+        c33 = c33.add(c3);
+      } 
+
+      // VPDday and VPDnight
+      var day_vpd_mat_daily1 = day_vpd_mat_daily.divide(c22); 
+      var night_vpd_mat_daily1 = night_vpd_mat_daily.divide(c33);
+
+      // date
+      var year_str = ('0000' + i).slice(-4);
+      var month_str = ('00' + j).slice(-2);
+      var day_str = ('00' + k).slice(-2);
+      var date_str = year_str + month_str + day_str; 
+
+      // VPDnight
+      Export.image.toDrive({
+        image: night_vpd_mat_daily1,
+        description: 'night_vpd_' + date_str,
+        fileNamePrefix: 'night_vpd_' + date_str,
+        folder: 'night_vpd_daily',
+        scale: 55000,
+        crs: "EPSG:4326",
+        maxPixels: 1e13
+      });
+        
+      // VPDday
+      Export.image.toDrive({
+        image: day_vpd_mat_daily1,
+        description: 'day_vpd_' + date_str,
+        fileNamePrefix: 'day_vpd_' + date_str,
+        folder: 'day_vpd_daily',
+        scale: 55000,
+        crs: "EPSG:4326",
+        maxPixels: 1e13
+      });
+      
+    } 
+  } 
+} 
